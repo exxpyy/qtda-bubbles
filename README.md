@@ -27,7 +27,7 @@ This repository applies **classical TDA** and other quantum methods to S&P 500 d
 - `scripts/validate_cpp.py` – Cross-checks the C++ engine against ripser ground truth  
 - `scripts/live_feed.py` – Live exchange WebSocket feed (Coinbase/Binance) for piping into the engine  
 - `scripts/backtest_baseline.py` – Causal backtest: TDA spikes vs. a realized-volatility baseline  
-- `cpp/` – C++17 streaming engine (see **C++ Streaming Engine** below)  
+- `cpp/` – C++ streaming engine (see **C++ Streaming Engine** below)  
 - `data/sp500.csv` – Daily S&P 500 closing prices (date, value)  
 - `plots/betti_curves.png` – Betti₀ curves over time  
 - `plots/crash_spikes.png` – Pairwise L² deltas with spikes flagged  
@@ -68,7 +68,7 @@ When **Betti₀ spikes** and **Δ spikes** occur together, they strongly align w
 Builds a Vietoris–Rips Laplacian for one window and uses **Quantum Phase Estimation (QPE)** on a simulator to estimate the Betti number from the Laplacian’s spectrum (zero eigenvalues ↔ connected components).
 
 **What the QPE bar chart shows**  
-- **Classical** (left): Betti₀ from persistent homology (ripser) — the true connectivity for that window.  
+- **Classical** (left): Betti₀ from persistent homology (ripser), the true connectivity for that window.  
 - **QPE est.** (right): Betti₀ estimated from the QPE zero-phase probability.
 
 **How to interpret:**  
@@ -87,12 +87,12 @@ These findings demonstrate that TDA-based indicators can act as **early signals 
 
 ## C++ Streaming Engine (`cpp/`)
 
-A real-time reimplementation of the TDA pipeline as a C++17 streaming engine: feed it one price per tick and it emits the Betti₀ curve, topology delta, and spike flag for the window ending at that tick — causally, with no lookahead.
+A causal redesign of the TDA pipeline as a C++ streaming engine: feed it one price per tick and it emits the Betti₀ curve, topology delta, and spike flag for the window ending at that tick, with no lookahead. Instead of recomputing persistent homology from scratch per window (as the batch pipeline does via ripser), it updates the filtration incrementally and matches the batch pipeline's output exactly.
 
 **How it works**
 - Each tick appends a log price, completes a new Takens embedding point, and slides the window.
 - **Incremental filtration update:** only the `w−1` distances involving the new point are computed (`O(w·m)` instead of `O(w²·m)`), then merged into an always-sorted edge list (`O(E)` merge instead of an `O(E log E)` re-sort).
-- **Single-sweep Betti₀:** one union-find pass (path halving + union by size) over the sorted edges yields the component count at every ε threshold simultaneously — no per-ε recomputation, no persistent homology library.
+- **Single-sweep Betti₀:** one union-find pass (path halving + union by size) over the sorted edges yields the component count at every ε threshold simultaneously, with no per-ε recomputation and no persistent homology library.
 - Spike detection uses a running (Welford) z-score over the L² deltas, so the signal is fully causal and suitable for live monitoring.
 
 **Build & run**
@@ -115,7 +115,7 @@ Output CSV: `date,betti@eps=…,delta,zscore,spike`.
 **Correctness**
 - `--benchmark` cross-checks the incremental edge list against a from-scratch recompute every tick (0 mismatches over all windows).
 - `scripts/validate_cpp.py` compares the engine's Betti₀ curves to ripser's persistent-homology output: **all 5,472 windows match exactly** (`--full`), and the delta column is bit-consistent with the emitted curves.
-- The causal spike flags concentrate in 2002, 2008–09, and 2020 — the dot-com bear market, the financial crisis, and the COVID crash — consistent with the batch pipeline's findings.
+- The causal spike flags concentrate in 2002, 2008 to 2009, and 2020 (the dot-com bear market, the financial crisis, and the COVID crash), consistent with the batch pipeline's findings.
 
 ### Live feed demo
 
@@ -126,7 +126,7 @@ python scripts/live_feed.py --product BTC-USD --interval 1.0 \
   | ./cpp/build/qtda_stream --csv - --w 30 --eps auto
 ```
 
-`--eps auto` calibrates the ε grid from distance quantiles (25/50/75/90%) of the first full window, so the same binary works at any price scale and frequency — on daily S&P closes auto-calibration recovers ε ≈ 0.055/0.076/0.102/0.128, nearly identical to the hand-tuned grid; on 1-second BTC ticks it lands around 10⁻⁴. The feed reconnects automatically on drops.
+`--eps auto` calibrates the ε grid from distance quantiles (25/50/75/90%) of the first full window, so the same binary works at any price scale and frequency. On daily S&P closes auto-calibration recovers ε ≈ 0.055/0.076/0.102/0.128, nearly identical to the hand-tuned grid; on 1-second BTC ticks it lands around 10⁻⁴. The feed reconnects automatically on drops.
 
 ### Does it beat a volatility filter? (honest backtest)
 
@@ -138,7 +138,7 @@ python scripts/live_feed.py --product BTC-USD --interval 1.0 \
 | Vol z>2 (20d) | 166 | 1/4 | 0.27 | 57% (3 episodes) |
 | Vol matched (top-125) | 125 | 1/4 | 0.30 | 43% (3 episodes) |
 
-**Honest takeaway:** under causal evaluation, the Betti₀ spike signal is a *coincident* crash detector, not a leading indicator — it fires during the violent phase of drawdowns (e.g. from 6 Oct 2008, with ~35% of the eventual peak-to-trough loss still ahead) but not in the 60 trading days before onset, and on this dataset it does not beat a simple volatility filter for early warning. The apparent "spikes precede crashes" pattern in the batch plots comes from the batch z-score's use of full-sample statistics, which a live signal doesn't have. Making the topological signal genuinely leading (e.g. via Betti₁ loop structure) is an open direction.
+**Honest takeaway:** under causal evaluation, the Betti₀ spike signal is a *coincident* crash detector, not a leading indicator. It fires during the violent phase of drawdowns (e.g. from 6 Oct 2008, with ~35% of the eventual peak-to-trough loss still ahead) but not in the 60 trading days before onset, and on this dataset it does not beat a simple volatility filter for early warning. The apparent "spikes precede crashes" pattern in the batch plots comes from the batch z-score's use of full-sample statistics, which a live signal doesn't have. Making the topological signal genuinely leading (e.g. via Betti₁ loop structure) is an open direction.
 
 ---
 
