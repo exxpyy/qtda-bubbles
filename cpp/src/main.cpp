@@ -79,7 +79,9 @@ void usage(const char* argv0) {
       << "  --m N             Takens embedding dimension (default 4)\n"
       << "  --d N             Takens delay (default 5)\n"
       << "  --w N             sliding window size (default 50)\n"
-      << "  --eps a,b,c       epsilon grid (default 0.05,0.07,0.1,0.12)\n"
+      << "  --eps a,b,c       epsilon grid (default 0.05,0.07,0.1,0.12), or 'auto'\n"
+      << "                    to calibrate from distance quantiles (25/50/75/90%)\n"
+      << "                    of the first full window — works at any price scale\n"
       << "  --z X             spike z-threshold (default 2.0)\n"
       << "  --min-history N   deltas required before z-scores emit (default 10)\n"
       << "  --benchmark       time incremental vs naive full-recompute per tick;\n"
@@ -113,13 +115,16 @@ int main(int argc, char** argv) {
       cfg.w = std::stoi(next("--w"));
     } else if (arg == "--eps") {
       cfg.eps.clear();
-      for (const std::string& tok : split(next("--eps"), ',')) {
-        double v;
-        if (!parse_double(tok, v)) {
-          std::cerr << "error: bad eps value '" << tok << "'\n";
-          return 2;
+      const std::string val = next("--eps");
+      if (val != "auto") {
+        for (const std::string& tok : split(val, ',')) {
+          double v;
+          if (!parse_double(tok, v)) {
+            std::cerr << "error: bad eps value '" << tok << "'\n";
+            return 2;
+          }
+          cfg.eps.push_back(v);
         }
-        cfg.eps.push_back(v);
       }
     } else if (arg == "--z") {
       cfg.z = std::stod(next("--z"));
@@ -150,9 +155,16 @@ int main(int argc, char** argv) {
     in = &file;
   }
 
-  std::cout << "date";
-  for (double e : det.config().eps) std::cout << ",betti@eps=" << e;
-  std::cout << ",delta,zscore,spike\n";
+  // With --eps auto the grid isn't known until the first full window, so the
+  // header is deferred until then.
+  bool header_written = false;
+  auto write_header = [&det, &header_written]() {
+    std::cout << "date";
+    for (double e : det.config().eps) std::cout << ",betti@eps=" << e;
+    std::cout << ",delta,zscore,spike" << std::endl;
+    header_written = true;
+  };
+  if (!det.config().eps.empty()) write_header();
 
   BenchStats inc_stats, naive_stats;
   std::size_t naive_mismatches = 0;
@@ -196,6 +208,7 @@ int main(int argc, char** argv) {
       if (ref != sig.betti) ++naive_mismatches;
     }
 
+    if (!header_written) write_header();
     std::cout << fields[0];
     for (int b : sig.betti) std::cout << ',' << b;
     if (sig.has_delta)
@@ -206,7 +219,7 @@ int main(int argc, char** argv) {
       std::cout << ',' << sig.zscore << ',' << (sig.spike ? 1 : 0);
     else
       std::cout << ",,0";
-    std::cout << '\n';
+    std::cout << std::endl;  // flush per row: required for live piped feeds
     ++rows;
     if (sig.spike) ++spikes;
   }

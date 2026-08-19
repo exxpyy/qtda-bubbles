@@ -25,6 +25,8 @@ This repository applies **classical TDA** and other quantum methods to S&P 500 d
 - `scripts/run_qpe.py` – QPE demo on one window/ε (bar chart comparing classical vs QPE Betti) 
 - `scripts/run_qtda.py` – Main script to run the full analysis  
 - `scripts/validate_cpp.py` – Cross-checks the C++ engine against ripser ground truth  
+- `scripts/live_feed.py` – Live exchange WebSocket feed (Coinbase/Binance) for piping into the engine  
+- `scripts/backtest_baseline.py` – Causal backtest: TDA spikes vs. a realized-volatility baseline  
 - `cpp/` – C++17 streaming engine (see **C++ Streaming Engine** below)  
 - `data/sp500.csv` – Daily S&P 500 closing prices (date, value)  
 - `plots/betti_curves.png` – Betti₀ curves over time  
@@ -114,6 +116,29 @@ Output CSV: `date,betti@eps=…,delta,zscore,spike`.
 - `--benchmark` cross-checks the incremental edge list against a from-scratch recompute every tick (0 mismatches over all windows).
 - `scripts/validate_cpp.py` compares the engine's Betti₀ curves to ripser's persistent-homology output: **all 5,472 windows match exactly** (`--full`), and the delta column is bit-consistent with the emitted curves.
 - The causal spike flags concentrate in 2002, 2008–09, and 2020 — the dot-com bear market, the financial crisis, and the COVID crash — consistent with the batch pipeline's findings.
+
+### Live feed demo
+
+The engine is fully causal, so it can run on a live market. `scripts/live_feed.py` connects to a public exchange WebSocket (Coinbase by default, Binance optional, no API key) and pipes one sampled price per interval into the engine's stdin:
+
+```bash
+python scripts/live_feed.py --product BTC-USD --interval 1.0 \
+  | ./cpp/build/qtda_stream --csv - --w 30 --eps auto
+```
+
+`--eps auto` calibrates the ε grid from distance quantiles (25/50/75/90%) of the first full window, so the same binary works at any price scale and frequency — on daily S&P closes auto-calibration recovers ε ≈ 0.055/0.076/0.102/0.128, nearly identical to the hand-tuned grid; on 1-second BTC ticks it lands around 10⁻⁴. The feed reconnects automatically on drops.
+
+### Does it beat a volatility filter? (honest backtest)
+
+`scripts/backtest_baseline.py` evaluates the causal TDA spikes against a 20-day realized-volatility z-score on identical terms: same dates, same z>2 threshold (plus a flag-count-matched variant), against objectively defined crash episodes (drawdown from trailing peak crossing −15%; 2000, 2008, 2018, 2020 in this dataset).
+
+| Detector | Flags | Pre-onset recall (60d) | Precision | Loss still ahead at first flag |
+|----------|-------|------------------------|-----------|-------------------------------|
+| TDA spikes (z>2) | 125 | 0/4 | 0.25 | 35% (3 episodes) |
+| Vol z>2 (20d) | 166 | 1/4 | 0.27 | 57% (3 episodes) |
+| Vol matched (top-125) | 125 | 1/4 | 0.30 | 43% (3 episodes) |
+
+**Honest takeaway:** under causal evaluation, the Betti₀ spike signal is a *coincident* crash detector, not a leading indicator — it fires during the violent phase of drawdowns (e.g. from 6 Oct 2008, with ~35% of the eventual peak-to-trough loss still ahead) but not in the 60 trading days before onset, and on this dataset it does not beat a simple volatility filter for early warning. The apparent "spikes precede crashes" pattern in the batch plots comes from the batch z-score's use of full-sample statistics, which a live signal doesn't have. Making the topological signal genuinely leading (e.g. via Betti₁ loop structure) is an open direction.
 
 ---
 

@@ -7,3 +7,4 @@ ripser
 scikit-tda
 qiskit
 qiskit-aer
+websockets

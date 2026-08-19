@@ -17,7 +17,9 @@ struct DetectorConfig {
   int m = 4;                                           // Takens embedding dimension
   int d = 5;                                           // Takens delay
   int w = 50;                                          // window size (embedding points)
-  std::vector<double> eps = {0.05, 0.07, 0.10, 0.12};  // sorted ascending on construction
+  std::vector<double> eps = {0.05, 0.07, 0.10, 0.12};  // sorted ascending on construction;
+                                                       // empty = auto-calibrate from the
+                                                       // first full window (see below)
   double z = 2.0;                                      // spike threshold on delta z-score
   int min_history = 10;                                // deltas required before z-scores emit
 };
@@ -44,7 +46,6 @@ class StreamingDetector {
   explicit StreamingDetector(DetectorConfig cfg) : cfg_(std::move(cfg)) {
     if (cfg_.m < 1 || cfg_.d < 1 || cfg_.w < 2)
       throw std::invalid_argument("require m >= 1, d >= 1, w >= 2");
-    if (cfg_.eps.empty()) throw std::invalid_argument("eps grid is empty");
     std::sort(cfg_.eps.begin(), cfg_.eps.end());
     lag_ = cfg_.d * (cfg_.m - 1);
     const std::size_t e = static_cast<std::size_t>(cfg_.w) * (cfg_.w - 1) / 2;
@@ -70,6 +71,16 @@ class StreamingDetector {
     add_point(std::move(p));
 
     if (static_cast<int>(points_.size()) < cfg_.w) return sig;
+
+    // Auto-calibration: with an empty eps grid, pick distance quantiles of the
+    // first full window so the scale adapts to any asset/frequency. edges_ is
+    // already sorted, so quantiles are direct lookups.
+    if (cfg_.eps.empty()) {
+      const double quantiles[] = {0.25, 0.50, 0.75, 0.90};
+      const std::size_t last = edges_.size() - 1;
+      for (double q : quantiles)
+        cfg_.eps.push_back(edges_[static_cast<std::size_t>(q * static_cast<double>(last))].dist);
+    }
 
     sig.ready = true;
     const std::uint32_t base = base_id_;
