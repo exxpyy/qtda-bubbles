@@ -63,6 +63,15 @@ def crash_episodes(prices: np.ndarray) -> list[dict]:
     return episodes
 
 
+def rolling_z(x: np.ndarray, win: int = 252) -> np.ndarray:
+    """Causal z-score against a rolling window: sensitive to local buildup,
+    where an expanding baseline grows desensitized after its first crisis."""
+    s = pd.Series(x)
+    mu = s.rolling(win).mean()
+    sd = s.rolling(win).std(ddof=0)
+    return ((s - mu) / (sd + 1e-12)).to_numpy()
+
+
 def causal_z(x: np.ndarray, min_hist: int = MIN_HIST) -> np.ndarray:
     """Expanding-window z-score using only data up to and including each day."""
     z = np.full(len(x), np.nan)
@@ -115,20 +124,45 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", default=str(ROOT / "cpp/build/qtda_stream"))
     ap.add_argument("--csv", default=str(ROOT / "data/sp500.csv"))
+    ap.add_argument("--dim", type=int, default=0, choices=[0, 1],
+                    help="Betti dimension for the TDA signal (0=components, 1=loops)")
+    ap.add_argument("--landscape", action="store_true",
+                    help="basket mode: flag when the causal z-score of the H1 "
+                         "landscape L1 norm level exceeds Z (expects a "
+                         "multi-series CSV; events anchor on its first series)")
     args = ap.parse_args()
 
+    if args.landscape and args.csv.endswith("sp500.csv"):
+        args.csv = str(ROOT / "data/indices.csv")
+
     df = pd.read_csv(args.csv)
-    df["date"] = pd.to_datetime(df["date"], dayfirst=True)
-    prices = df["close"].to_numpy(dtype=float)
+    df["date"] = pd.to_datetime(df["date"], dayfirst=not args.landscape)
+    price_col = df.columns[1] if args.landscape else "close"
+    prices = df[price_col].to_numpy(dtype=float)
 
     # TDA flags from the C++ engine, mapped back to price-series indices.
-    proc = subprocess.run([args.binary, "--csv", args.csv],
-                          capture_output=True, text=True, check=True)
+    if args.landscape:
+        cmd = [args.binary, "--csv", args.csv, "--basket", "--landscape",
+               "--eps", "1.0", "--w", "50"]
+    else:
+        cmd = [args.binary, "--csv", args.csv, "--dim", str(args.dim)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
     cpp = pd.read_csv(io.StringIO(proc.stdout))
-    cpp["date"] = pd.to_datetime(cpp["date"], dayfirst=True)
+    cpp["date"] = pd.to_datetime(cpp["date"], dayfirst=not args.landscape)
     date_to_idx = {d: i for i, d in enumerate(df["date"])}
     cpp_idx = cpp["date"].map(date_to_idx).to_numpy()
-    tda_flags = cpp_idx[cpp["spike"].to_numpy() == 1]
+    if args.landscape:
+        # Level, not jump: an elevated norm is the hypothesized precursor.
+        # Two causal normalizations, both reported: expanding (all history)
+        # and rolling one-year (local anomaly).
+        norm = cpp["l1norm"].to_numpy(dtype=float)
+        tda_exp = cpp_idx[causal_z(norm, min_hist=252) > Z]
+        tda_flags = cpp_idx[np.nan_to_num(rolling_z(norm), nan=-np.inf) > Z]
+        tda_label = "Landscape L1 roll-252 z>2"
+    else:
+        tda_exp = None
+        tda_flags = cpp_idx[cpp["spike"].to_numpy() == 1]
+        tda_label = f"TDA B{args.dim} spikes (z>2)"
 
     # Volatility baseline on the same dates.
     logret = np.diff(np.log(prices), prepend=np.nan)
@@ -150,11 +184,14 @@ def main():
         print(f"  onset {df['date'].iloc[ep['onset']].date()}  "
               f"trough {df['date'].iloc[ep['trough']].date()}  ({dd:.0%})")
 
-    rows = {
-        "TDA spikes (z>2)": evaluate(tda_flags, episodes, prices),
-        f"Vol z>2 ({VOL_WINDOW}d)": evaluate(vol_flags, episodes, prices),
-        f"Vol top-{n_tda} (matched)": evaluate(vol_matched, episodes, prices),
-    }
+    rows = {tda_label: evaluate(tda_flags, episodes, prices)}
+    if tda_exp is not None:
+        rows["Landscape L1 expand z>2"] = evaluate(tda_exp, episodes, prices)
+        # Give the volatility baseline the identical rolling normalization.
+        vol_roll = evaluable[np.nan_to_num(rolling_z(vol)[evaluable], nan=-np.inf) > Z]
+        rows[f"Vol roll-252 z>2 ({VOL_WINDOW}d)"] = evaluate(vol_roll, episodes, prices)
+    rows[f"Vol z>2 ({VOL_WINDOW}d)"] = evaluate(vol_flags, episodes, prices)
+    rows[f"Vol top-{n_tda} (matched)"] = evaluate(vol_matched, episodes, prices)
     print(f"\n{'detector':<26}{'flags':>7}{'recall':>9}{'precision':>11}{'med lead':>10}"
           f"{'loss ahead':>12}")
     for name, r in rows.items():

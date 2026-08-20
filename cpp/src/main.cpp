@@ -79,6 +79,14 @@ void usage(const char* argv0) {
       << "  --m N             Takens embedding dimension (default 4)\n"
       << "  --d N             Takens delay (default 5)\n"
       << "  --w N             sliding window size (default 50)\n"
+      << "  --dim K           Betti dimension: 0 = components (default),\n"
+      << "                    1 = loops via Z/2 persistence reduction\n"
+      << "  --basket          multi-series input (date,p1,p2,...): each tick's\n"
+      << "                    point is the vector of log returns across the\n"
+      << "                    basket; Takens m/d are not used\n"
+      << "  --landscape       emit the H1 persistence landscape L1 norm per\n"
+      << "                    window instead of Betti counts (implies --dim 1;\n"
+      << "                    the largest eps is the filtration cap)\n"
       << "  --eps a,b,c       epsilon grid (default 0.05,0.07,0.1,0.12), or 'auto'\n"
       << "                    to calibrate from distance quantiles (25/50/75/90%)\n"
       << "                    of the first full window — works at any price scale\n"
@@ -95,6 +103,7 @@ int main(int argc, char** argv) {
   std::string csv_path = "data/sp500.csv";
   DetectorConfig cfg;
   bool benchmark = false;
+  bool basket = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -126,6 +135,12 @@ int main(int argc, char** argv) {
           cfg.eps.push_back(v);
         }
       }
+    } else if (arg == "--dim") {
+      cfg.dim = std::stoi(next("--dim"));
+    } else if (arg == "--basket") {
+      basket = true;
+    } else if (arg == "--landscape") {
+      cfg.landscape = true;
     } else if (arg == "--z") {
       cfg.z = std::stod(next("--z"));
     } else if (arg == "--min-history") {
@@ -142,6 +157,10 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (benchmark && cfg.landscape) {
+    std::cerr << "error: --benchmark compares Betti curves; not supported with --landscape\n";
+    return 2;
+  }
   StreamingDetector det(cfg);
 
   std::ifstream file;
@@ -160,11 +179,15 @@ int main(int argc, char** argv) {
   bool header_written = false;
   auto write_header = [&det, &header_written]() {
     std::cout << "date";
-    for (double e : det.config().eps) std::cout << ",betti@eps=" << e;
+    if (det.config().landscape) {
+      std::cout << ",l1norm";
+    } else {
+      for (double e : det.config().eps) std::cout << ",betti@eps=" << e;
+    }
     std::cout << ",delta,zscore,spike" << std::endl;
     header_written = true;
   };
-  if (!det.config().eps.empty()) write_header();
+  if (det.config().landscape || !det.config().eps.empty()) write_header();
 
   BenchStats inc_stats, naive_stats;
   std::size_t naive_mismatches = 0;
@@ -185,17 +208,37 @@ int main(int argc, char** argv) {
         continue;
       }
     }
-    const std::size_t col =
-        price_col >= 0 ? static_cast<std::size_t>(price_col) : fields.size() - 1;
-    double price;
-    if (col >= fields.size() || !parse_double(fields[col], price) || price <= 0.0) {
-      std::cerr << "[warn] skipping unparseable row: " << line << "\n";
-      continue;
+    Signal sig;
+    std::chrono::steady_clock::time_point t0, t1;
+    if (basket) {
+      // All columns after the date are one price per series.
+      std::vector<double> prices;
+      prices.reserve(fields.size() - 1);
+      bool ok = fields.size() >= 3;
+      for (std::size_t i = 1; ok && i < fields.size(); ++i) {
+        double v;
+        ok = parse_double(fields[i], v) && v > 0.0;
+        prices.push_back(v);
+      }
+      if (!ok) {
+        std::cerr << "[warn] skipping unparseable row: " << line << "\n";
+        continue;
+      }
+      t0 = std::chrono::steady_clock::now();
+      sig = det.on_prices(prices);
+      t1 = std::chrono::steady_clock::now();
+    } else {
+      const std::size_t col =
+          price_col >= 0 ? static_cast<std::size_t>(price_col) : fields.size() - 1;
+      double price;
+      if (col >= fields.size() || !parse_double(fields[col], price) || price <= 0.0) {
+        std::cerr << "[warn] skipping unparseable row: " << line << "\n";
+        continue;
+      }
+      t0 = std::chrono::steady_clock::now();
+      sig = det.on_price(price);
+      t1 = std::chrono::steady_clock::now();
     }
-
-    const auto t0 = std::chrono::steady_clock::now();
-    Signal sig = det.on_price(price);
-    const auto t1 = std::chrono::steady_clock::now();
     ++ticks;
     if (!sig.ready) continue;
 
@@ -210,7 +253,10 @@ int main(int argc, char** argv) {
 
     if (!header_written) write_header();
     std::cout << fields[0];
-    for (int b : sig.betti) std::cout << ',' << b;
+    if (sig.has_norm)
+      std::cout << ',' << sig.l1norm;
+    else
+      for (int b : sig.betti) std::cout << ',' << b;
     if (sig.has_delta)
       std::cout << ',' << sig.delta;
     else
@@ -225,7 +271,12 @@ int main(int argc, char** argv) {
   }
 
   std::cerr << "[info] ticks=" << ticks << " windows=" << rows << " spikes=" << spikes
-            << " (m=" << cfg.m << " d=" << cfg.d << " w=" << cfg.w << ")\n";
+            << " (w=" << cfg.w << " dim=" << det.config().dim
+            << (basket ? " basket" : "") << (det.config().landscape ? " landscape" : "");
+  if (!basket) std::cerr << " m=" << cfg.m << " d=" << cfg.d;
+  if (!det.config().eps.empty())
+    std::cerr << " eps_max=" << det.config().eps.back();
+  std::cerr << ")\n";
 
   if (benchmark) {
     std::cerr << "[bench] per-tick latency over " << inc_stats.us.size() << " windows (w=" << cfg.w

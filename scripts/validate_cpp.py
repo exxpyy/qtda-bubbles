@@ -25,9 +25,51 @@ from src.takens import takens_embedding, sliding_windows  # noqa: E402
 from ripser import ripser  # noqa: E402
 
 
-def betti0_ripser(pc: np.ndarray, eps_grid) -> list[int]:
-    dgm = ripser(pc, maxdim=0)["dgms"][0]
-    return [int(np.sum((dgm[:, 0] < e) & (e < dgm[:, 1]))) for e in eps_grid]
+def betti_ripser(pc: np.ndarray, eps_grid, dim: int) -> list[int]:
+    dgm = ripser(pc, maxdim=dim)["dgms"][dim]
+    # H0 births are all 0 so strictness of the birth comparison is moot there;
+    # for H1 the complex at eps includes simplices of diameter exactly eps,
+    # hence birth <= eps.
+    return [int(np.sum((dgm[:, 0] <= e) & (e < dgm[:, 1]))) for e in eps_grid]
+
+
+def validate_landscape(args) -> int:
+    """Check basket-mode H1 landscape L1 norms against ripser: the norm is
+    sum of (death - birth)^2 / 4 over the H1 diagram of each window of
+    cross-series log-return vectors (uncapped filtration, so all loops die
+    naturally and the norm is parameter-free)."""
+    cmd = [args.binary, "--csv", args.csv, "--basket", "--landscape",
+           "--eps", "1.0", "--w", str(args.w)]
+    print(f"[run] {' '.join(cmd)}")
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    cpp = pd.read_csv(io.StringIO(proc.stdout))
+
+    df = pd.read_csv(args.csv, index_col=0)
+    X = np.diff(np.log(df.to_numpy(dtype=float)), axis=0)
+    windows = sliding_windows(X, w=args.w)
+    assert len(windows) == len(cpp), (
+        f"window count mismatch: python={len(windows)} cpp={len(cpp)}")
+    print(f"[ok] window count matches: {len(windows)}")
+
+    idx = np.unique(np.linspace(0, len(windows) - 1, args.limit).astype(int))
+    print(f"[run] checking {len(idx)} windows against ripser ...")
+    cpp_norm = cpp["l1norm"].to_numpy(dtype=float)
+    mismatches = 0
+    for n, i in enumerate(idx):
+        dgm = ripser(windows[i], maxdim=1)["dgms"][1]
+        ref = float(np.sum((dgm[:, 1] - dgm[:, 0]) ** 2) / 4.0)
+        # ripser emits float32 diagrams; compare with matching tolerance.
+        if not np.isclose(ref, cpp_norm[i], rtol=1e-4, atol=1e-15):
+            mismatches += 1
+            print(f"[FAIL] window {i} ({cpp.iloc[i, 0]}): ripser={ref:.6e} "
+                  f"cpp={cpp_norm[i]:.6e}")
+        if (n + 1) % 100 == 0:
+            print(f"  ... {n + 1}/{len(idx)}")
+    if mismatches == 0:
+        print(f"[PASS] {len(idx)} windows: landscape norms match ripser")
+        return 0
+    print(f"[FAIL] {mismatches} mismatching windows")
+    return 1
 
 
 def main():
@@ -38,14 +80,22 @@ def main():
     ap.add_argument("--d", type=int, default=5)
     ap.add_argument("--w", type=int, default=50)
     ap.add_argument("--eps", type=float, nargs="+", default=[0.05, 0.07, 0.1, 0.12])
+    ap.add_argument("--dim", type=int, default=0, choices=[0, 1])
+    ap.add_argument("--landscape", action="store_true",
+                    help="validate basket-mode H1 landscape L1 norms on a "
+                         "multi-series CSV (pass it via --csv) against ripser")
     ap.add_argument("--limit", type=int, default=500,
                     help="number of windows to check against ripser (evenly sampled)")
     ap.add_argument("--full", action="store_true", help="check every window")
     args = ap.parse_args()
 
+    if args.landscape:
+        return validate_landscape(args)
+
     eps = sorted(args.eps)
     cmd = [args.binary, "--csv", args.csv, "--m", str(args.m), "--d", str(args.d),
-           "--w", str(args.w), "--eps", ",".join(str(e) for e in eps)]
+           "--w", str(args.w), "--dim", str(args.dim),
+           "--eps", ",".join(str(e) for e in eps)]
     print(f"[run] {' '.join(cmd)}")
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
     cpp = pd.read_csv(io.StringIO(proc.stdout))
@@ -68,7 +118,7 @@ def main():
 
     mismatches = 0
     for n, i in enumerate(idx):
-        ref = betti0_ripser(windows[i], eps)
+        ref = betti_ripser(windows[i], eps, args.dim)
         got = cpp_betti[i].tolist()
         if ref != got:
             mismatches += 1
